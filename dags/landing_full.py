@@ -1,17 +1,15 @@
 from airflow import DAG
 from airflow.providers.databricks.operators.databricks_sql import DatabricksSqlOperator
 from airflow.providers.microsoft.azure.operators.data_factory import AzureDataFactoryRunPipelineOperator
-from airflow.utils.task_group import TaskGroup
-from airflow.models.baseoperator import chain
 from airflow.operators.empty import EmptyOperator
+from airflow.decorators import task
 from datetime import datetime, timedelta
-
+import json
 
 RESOURCE_GROUP_NAME = "datafactory-rg134"
 FACTORY_NAME = "mauroloprete-df"
-PIPELINE_NAME = "pipeline1_helloworld"
+PIPELINE_NAME = "copy_landing"
 AZURE_CONN_ID = "azuredf"
-
 
 default_args = {
     'owner': 'airflow',
@@ -20,89 +18,122 @@ default_args = {
 }
 
 with DAG(
-    dag_id='data_landing_provisioning',
+    dag_id='landing_dynamic_expand',
     default_args=default_args,
     start_date=datetime(2025, 1, 1),
     schedule='@hourly',
     catchup=False,
     max_active_runs=1,
-    description='Provisiona la capa landing desde múltiples orígenes',
-    tags=['landing', 'adf', 'databricks', 'orquestación'],
+    tags=['landing', 'expand', 'adf'],
 ) as dag:
 
     start = EmptyOperator(task_id="start")
     end = EmptyOperator(task_id="end")
 
-    # 1. Obtener lista de entidades a ejecutar desde Databricks
     fetch_entities = DatabricksSqlOperator(
         task_id='fetch_entities_to_run',
         databricks_conn_id='databricks_default',
         sql="""
-        SELECT 1
+        WITH latest_success AS (
+        SELECT
+            id_entity,
+            MAX(TO_TIMESTAMP_NTZ(CAST(date AS STRING), 'yyyyMMdd')) AS last_success_date
+        FROM dev_ref_control.general.ref_log_execs
+        WHERE status = 'success'
+        GROUP BY id_entity
+        ),
+        to_run AS (
+        SELECT 
+            en.id_entity,
+            en.grouper_name,
+            en.layer_name,
+            en.container_name,
+            en.entity_name,
+            en.defined_calendar,
+            par.parameter_name as parameters,
+            en.activation_state,
+            ls.last_success_date
+        FROM dev_ref_control.general.ref_master_entities en
+        INNER JOIN dev_ref_control.general.ref_master_parameters par 
+            ON par.id_entity = en.id_entity
+        LEFT JOIN dev_ref_control.general.ref_relation_ingest_connection relcon 
+            ON relcon.id_entity = en.id_entity
+        LEFT JOIN dev_ref_control.general.ref_connections con 
+            ON con.id_connection = relcon.id_connection
+        LEFT JOIN latest_success ls 
+            ON ls.id_entity = en.id_entity
+        WHERE en.active_state = 'Y'
+        )
+        SELECT *
+        FROM to_run
+        WHERE (
+        (defined_calendar = 'hourly' AND (last_success_date IS NULL OR DATE_TRUNC('HOUR', last_success_date) < DATE_TRUNC('HOUR', CURRENT_TIMESTAMP)))
+        OR
+        (defined_calendar = 'daily' AND (last_success_date IS NULL OR DATE(last_success_date) < CURRENT_DATE))
+        OR
+        (defined_calendar = 'monthly' AND (last_success_date IS NULL OR DATE_TRUNC('MONTH', last_success_date) < DATE_TRUNC('MONTH', CURRENT_DATE)))
+        OR
+        (defined_calendar = 'quarterly' AND (last_success_date IS NULL OR DATE_TRUNC('QUARTER', last_success_date) < DATE_TRUNC('QUARTER', CURRENT_DATE)))
+        OR
+        (defined_calendar = 'yearly' AND (last_success_date IS NULL OR DATE_TRUNC('YEAR', last_success_date) < DATE_TRUNC('YEAR', CURRENT_DATE)))
+        )
         """,
+        http_path="/sql/1.0/warehouses/2eea0c5450238ddf",
         do_xcom_push=True,
+        output_format="json"
     )
 
-    start >> fetch_entities
 
-    def build_origen_groups(**context):
-        from airflow.models.xcom import XCom
-        import json
-        from airflow.models.taskinstance import TaskInstance
-
-        ti: TaskInstance = context["ti"]
-        entities = ti.xcom_pull(task_ids='fetch_entities_to_run')
-
-        grouped = {}
-        for row in entities:
-            origen = row['origen']
-            grouped.setdefault(origen, []).append(row)
-
-        # Ordenar las entidades dentro de cada grupo por peso promedio
-        for origen in grouped:
-            grouped[origen] = sorted(grouped[origen], key=lambda x: x['peso_promedio_mb'])
-
-        return grouped
-
-    from airflow.decorators import task
+    from airflow.exceptions import AirflowFailException
+    import json
+    import ast
 
     @task
-    def get_origen_groups():
-        return build_origen_groups()
+    def extract_params(ti=None):
+        columns_data, rows_data = ti.xcom_pull(task_ids='fetch_entities_to_run')
+        columns = [col[0] for col in columns_data]
+        results = []
 
-    origen_groups = get_origen_groups()
-    fetch_entities >> origen_groups
+        for row in rows_data:
+            params_str = row[columns.index('parameters')]
+            print("RAW parameters string:", params_str)
+            parsed_parameters = {}
 
-    # 2. Crear tareas dinámicamente agrupadas por origen
-    
-    from airflow.operators.python import get_current_context
-    @task
-    def create_tasks_per_origen():
-        context = get_current_context()
-        grouped = context['ti'].xcom_pull(task_ids='get_origen_groups')
+            if params_str:
+                try:
+                    fixed_str = params_str
+                    parsed_parameters = json.loads(fixed_str)
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding fixed JSON: {e}")
+                    try:
+                        parsed_parameters = ast.literal_eval(fixed_str)
+                    except Exception as ex:
+                        print(f"Fallback parsing also failed: {ex}")
+                        parsed_parameters = {}
 
-        for origen, entidades in grouped.items():
-            with TaskGroup(group_id=f"group_{origen}") as origen_group:
-                last_task = None
+            if not parsed_parameters:
+                raise AirflowFailException(
+                    f"Invalid or empty parameters for entity ID {row[columns.index('id_entity')]}. Aborting DAG."
+                )
 
-                for idx, entidad in enumerate(entidades):
-                    run_adf_pipeline = AzureDataFactoryRunPipelineOperator(
-                        task_id=f"run_pipeline_{entidad['entidad_id']}",
-                        azure_data_factory_conn_id=AZURE_CONN_ID,
-                        pipeline_name=entidad['pipeline_adf'],
-                        factory_name=FACTORY_NAME,
-                        resource_group_name=RESOURCE_GROUP_NAME,
-                        parameters=json.loads(entidad['parametros_adf']),
-                        wait_for_termination=True,
-                    )
+            results.append({
+                "task_id": f"run_pipeline_{row[columns.index('id_entity')]}",
+                "parameters": {
+                    "params_copy": parsed_parameters
+                },
+                "azure_data_factory_conn_id": AZURE_CONN_ID,
+                "pipeline_name": PIPELINE_NAME,
+                "factory_name": FACTORY_NAME,
+                "resource_group_name": RESOURCE_GROUP_NAME,
+                "wait_for_termination": True,
+            })
 
-                    if last_task:
-                        last_task >> run_adf_pipeline
-                    last_task = run_adf_pipeline
+        return results
 
-                origen_group >> end
-                start >> origen_group
 
-    trigger_tasks = create_tasks_per_origen()
-    origen_groups >> trigger_tasks
+    entity_configs = extract_params()
 
+    run_pipelines = AzureDataFactoryRunPipelineOperator.partial(task_id = "run_pipeline").expand_kwargs(entity_configs)
+
+
+    start >> fetch_entities >> entity_configs >> dag.get_task("run_pipeline") >> end
